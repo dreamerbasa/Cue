@@ -1,9 +1,12 @@
+import logging
 import re
 from urllib.parse import urlparse, parse_qs
 
 import requests
 import trafilatura
 from youtube_transcript_api import YouTubeTranscriptApi
+
+logger = logging.getLogger(__name__)
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
 
@@ -19,6 +22,42 @@ _PLATFORM_MAP = [
     ("linkedin.com", "linkedin"),
     ("medium.com", "medium"),
 ]
+
+_AUTH_REDIRECT_PATHS = ["/login", "/signup", "/register", "/auth", "/uas/login"]
+
+_JUNK_SIGNATURES = [
+    "agree & join linkedin",
+    "already on linkedin? sign in",
+    "linkedin's user agreement, privacy policy",
+    "looking to create a page for a business",
+]
+
+
+def _is_wall_content(text: str) -> bool:
+    """Returns True if 2+ junk signatures found — likely a login wall served with 200 status."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    hits = sum(1 for sig in _JUNK_SIGNATURES if sig in text_lower)
+    return hits >= 2
+
+
+def get_url_display_title(url: str, platform: str) -> str:
+    """Generate a human-readable fallback title when extraction fails."""
+    platform_titles = {
+        "linkedin": "LinkedIn post",
+        "instagram": "Instagram post",
+        "medium": "Medium article",
+        "substack": "Substack article",
+        "youtube": "YouTube video",
+    }
+    if platform in platform_titles:
+        return platform_titles[platform]
+    try:
+        domain = urlparse(url).netloc.replace("www.", "")
+        return f"Page from {domain}"
+    except Exception:
+        return "Web page"
 
 
 def _detect_platform(url: str) -> str:
@@ -82,6 +121,12 @@ def _extract_medium(url: str) -> str:
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
+
+        final_url = resp.url.lower()
+        if any(path in final_url for path in _AUTH_REDIRECT_PATHS):
+            logger.info(f"Extraction blocked (redirect to auth): {url} → {resp.url}")
+            return None
+
         text = trafilatura.extract(resp.text, favor_recall=True)
         if not text:
             return None
@@ -93,23 +138,44 @@ def _extract_medium(url: str) -> str:
         return None
 
 
-def _extract_web(url: str) -> str:
+def _extract_web(url: str) -> str | None:
     try:
         resp = requests.get(url, headers=_HEADERS, timeout=15)
         resp.raise_for_status()
+
+        final_url = resp.url.lower()
+        if any(path in final_url for path in _AUTH_REDIRECT_PATHS):
+            logger.info(f"Extraction blocked (redirect to auth): {url} → {resp.url}")
+            return None
+
         text = trafilatura.extract(resp.text, favor_recall=True)
         if not text:
-            return f"Could not extract content. Original URL: {url}"
+            logger.info(f"Extraction blocked (trafilatura returned None): {url}")
+            return None
+
+        if _is_wall_content(text):
+            logger.info(f"Extraction blocked (wall signatures matched): {url}")
+            return None
+
         words = text.split()
         if len(words) > 1000:
             text = " ".join(words[:1000])
         return text
     except Exception:
-        return f"Could not extract content. Original URL: {url}"
+        logger.info(f"Extraction blocked (request failed): {url}")
+        return None
 
 
 def find_urls(raw_content: str) -> list:
     return _URL_PATTERN.findall(raw_content)
+
+
+def _failure_reason(platform: str) -> str:
+    if platform == "linkedin":
+        return "Couldn't read this page — LinkedIn requires sign-in to view posts"
+    if platform == "medium":
+        return "Couldn't read this page — Medium requires sign-in for some articles"
+    return "Couldn't read this page — it may be behind a paywall or unavailable"
 
 
 def extract_single(url: str, user_note: str = None) -> dict:
@@ -137,12 +203,27 @@ def extract_single(url: str, user_note: str = None) -> dict:
                 "url": url,
                 "user_note": user_note,
                 "needs_screenshot": True,
+                "extraction_failed": True,
+                "failure_reason": _failure_reason("medium"),
             }
 
     if source_platform == "youtube":
         extracted_text = _extract_youtube(url)
     elif source_platform != "medium":
         extracted_text = _extract_web(url)
+
+    if extracted_text is None and source_platform not in ("instagram", "medium"):
+        return {
+            "content_type": "url",
+            "raw_content": url,
+            "extracted_text": None,
+            "source_platform": source_platform,
+            "url": url,
+            "user_note": user_note,
+            "needs_screenshot": True,
+            "extraction_failed": True,
+            "failure_reason": _failure_reason(source_platform),
+        }
 
     if user_note and extracted_text:
         extracted_text = f"User note: {user_note}\n\n{extracted_text}"
@@ -194,12 +275,27 @@ def extract(raw_content: str) -> dict:
                 "url": url,
                 "user_note": user_note,
                 "needs_screenshot": True,
+                "extraction_failed": True,
+                "failure_reason": _failure_reason("medium"),
             }
 
     if source_platform == "youtube":
         extracted_text = _extract_youtube(url)
     elif source_platform != "medium":
         extracted_text = _extract_web(url)
+
+    if extracted_text is None and source_platform not in ("instagram", "medium"):
+        return {
+            "content_type": "url",
+            "raw_content": raw_content,
+            "extracted_text": None,
+            "source_platform": source_platform,
+            "url": url,
+            "user_note": user_note,
+            "needs_screenshot": True,
+            "extraction_failed": True,
+            "failure_reason": _failure_reason(source_platform),
+        }
 
     if user_note and extracted_text:
         extracted_text = f"User note: {user_note}\n\n{extracted_text}"

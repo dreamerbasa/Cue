@@ -474,6 +474,24 @@ def search_by_embedding(user_id: str, query_embedding: list[float], limit: int =
     return response.data
 
 
+def update_item_from_context(item_id: str, category_id: str, category_name: str,
+                              title: str, summary: str, tags: list,
+                              extracted_text: str, image_path: str = None) -> dict:
+    """Update an existing uncategorized item with fresh classification after user provides context."""
+    update_data = {
+        "extracted_text": extracted_text,
+        "category_id": category_id,
+        "title": title,
+        "summary": summary,
+        "tags": tags,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if image_path:
+        update_data["image_path"] = image_path
+    result = supabase.table("items").update(update_data).eq("id", item_id).execute()
+    return result.data[0] if result.data else None
+
+
 def update_after_surface(item_id: str):
 
 

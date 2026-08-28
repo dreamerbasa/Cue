@@ -2,7 +2,7 @@ import io
 import logging
 import tempfile
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 
 logger = logging.getLogger(__name__)
 from telegram.ext import (
@@ -12,13 +12,15 @@ from telegram.ext import (
 
 from config import TELEGRAM_BOT_TOKEN, AUTHORIZED_USER_IDS
 from pipeline.router import process_message
+from pipeline.extractors import text, vision, whisper
+from pipeline.classifier import classify
 from db.queries import (
     update_item_rating, get_item, upsert_user, get_user_by_telegram_id,
     update_last_active, set_user_active, update_reminder_time, update_nudge_time,
     archive_item, done_item, remind_later, keep_item, get_image_bytes,
     get_pending_items, set_remind_tonight, set_go_deep,
     get_categories_with_counts, search_items, get_user_stats,
-    update_item_embedding, update_user_email,
+    update_item_embedding, update_user_email, update_item_from_context,
 )
 import asyncio
 
@@ -27,6 +29,8 @@ from intelligence.embeddings import build_embedding_text, generate_embedding
 from db.queries import update_item_embedding
 from notifications.daily_nudge import build_list_view, build_detail_view, escape_html, _list_line
 from notifications.nudge_session import get_session, set_session, REVIEW_PAGE_SIZE
+
+_pending_context: dict[int, str] = {}
 
 
 def _is_authorized(update: Update) -> bool:
@@ -54,8 +58,8 @@ _GOAL_EMOJI = {3: "\U0001f3af", 2: "↔️", 1: "❌"}
 _GOAL_LABEL = {3: "\U0001f3af Aligned", 2: "↔️ Somewhat", 1: "❌ Nope"}
 
 
-def _rating_keyboard(item_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _rating_keyboard(item_id: str, include_context: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton("\U0001f525 High", callback_data=f"interest_3_{item_id}"),
             InlineKeyboardButton("\U0001f44d Medium", callback_data=f"interest_2_{item_id}"),
@@ -69,10 +73,16 @@ def _rating_keyboard(item_id: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⏰ Remind tonight", callback_data=f"remind_tonight_{item_id}"),
         ],
-    ])
+    ]
+    if include_context:
+        rows.append([
+            InlineKeyboardButton("📎 Add screenshot or note", callback_data=f"ctx_{item_id}"),
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
-def _remaining_keyboard(item_id: str, interest_rated: bool, goal_rated: bool, remind_set: bool) -> InlineKeyboardMarkup | None:
+def _remaining_keyboard(item_id: str, interest_rated: bool, goal_rated: bool,
+                         remind_set: bool, include_context: bool = False) -> InlineKeyboardMarkup | None:
     rows = []
     if not interest_rated:
         rows.append([
@@ -89,6 +99,10 @@ def _remaining_keyboard(item_id: str, interest_rated: bool, goal_rated: bool, re
     if not remind_set:
         rows.append([
             InlineKeyboardButton("⏰ Remind tonight", callback_data=f"remind_tonight_{item_id}"),
+        ])
+    if include_context:
+        rows.append([
+            InlineKeyboardButton("📎 Add screenshot or note", callback_data=f"ctx_{item_id}"),
         ])
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -128,19 +142,25 @@ async def _send_save_response(message, result):
         for r in result:
             if r.get("status") == "needs_screenshot":
                 skipped.append(r["message"])
+            elif r.get("extraction_failed"):
+                saved.append(r)
             else:
                 saved.append(r)
 
         if saved:
             lines = [f"Saved {len(saved)} item{'s' if len(saved) > 1 else ''}:"]
             for i, r in enumerate(saved, 1):
-                lines.append(f"{i}. {r['category_name']}: {r['title']}")
+                if r.get("extraction_failed"):
+                    lines.append(f"{i}. Uncategorized: {r['title']} ⚠️")
+                else:
+                    lines.append(f"{i}. {r['category_name']}: {r['title']}")
             await message.reply_text(_truncate("\n".join(lines)))
 
             for r in saved:
+                include_ctx = bool(r.get("extraction_failed"))
                 await message.reply_text(
                     f"Rate: {r['title']}",
-                    reply_markup=_rating_keyboard(r["item_id"]),
+                    reply_markup=_rating_keyboard(r["item_id"], include_context=include_ctx),
                 )
 
         for msg in skipped:
@@ -148,6 +168,19 @@ async def _send_save_response(message, result):
 
         for r in saved:
             asyncio.get_event_loop().run_in_executor(None, _fire_embedding, r)
+        return
+
+    if isinstance(result, dict) and result.get("extraction_failed"):
+        failure_msg = result.get("failure_reason", "")
+        text = f"Saved link under Uncategorized: {result['title']}"
+        if failure_msg:
+            text += f"\n⚠️ {failure_msg}"
+        await message.reply_text(text)
+        await message.reply_text(
+            "Interest level? / Goal alignment?",
+            reply_markup=_rating_keyboard(result["item_id"], include_context=True),
+        )
+        asyncio.get_event_loop().run_in_executor(None, _fire_embedding, result)
         return
 
     tags = ", ".join(result["tags"])
@@ -631,10 +664,98 @@ async def handle_review_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def handle_context_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        await update.callback_query.answer("Not authorized.")
+        return
+    query = update.callback_query
+    await query.answer()
+
+    item_id = query.data.replace("ctx_", "")
+
+    # Cap pending context dict at 100 entries
+    if len(_pending_context) >= 100:
+        oldest_keys = sorted(_pending_context.keys())[:50]
+        for k in oldest_keys:
+            del _pending_context[k]
+
+    sent = await query.message.reply_text(
+        f"📎 Send a screenshot or short note about this link, and I'll update the classification.",
+        reply_markup=ForceReply(selective=True),
+    )
+    _pending_context[sent.message_id] = item_id
+
+
+async def _handle_context_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: str):
+    """Process a user's reply that provides context for a failed-extraction URL save."""
+    try:
+        if update.message.photo:
+            photo = update.message.photo[-1]
+            file = await context.bot.get_file(photo.file_id)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp.close()
+            await file.download_to_drive(tmp.name)
+            extracted_data = vision.extract(tmp.name, update.message.caption or "")
+        elif update.message.voice:
+            voice = update.message.voice
+            file = await context.bot.get_file(voice.file_id)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
+            tmp.close()
+            await file.download_to_drive(tmp.name)
+            extracted_data = whisper.extract(tmp.name, "")
+        else:
+            extracted_data = text.extract(update.message.text)
+
+        extracted_text = extracted_data.get("extracted_text")
+        if not extracted_text:
+            await update.message.reply_text(
+                "Couldn't read that either — try a screenshot or a short text description."
+            )
+            return
+
+        classification = classify(extracted_text)
+
+        update_item_from_context(
+            item_id=item_id,
+            category_id=classification["category_id"],
+            category_name=classification["category_name"],
+            title=classification["title"],
+            summary=classification["summary"],
+            tags=classification["tags"],
+            extracted_text=extracted_text,
+            image_path=extracted_data.get("image_path"),
+        )
+
+        tags = ", ".join(classification["tags"])
+        await update.message.reply_text(
+            f"Updated! Saved under {classification['category_name']}: {classification['title']}\n\nTags: {tags}"
+        )
+
+        result_for_embedding = {
+            "item_id": item_id,
+            "title": classification["title"],
+            "summary": classification["summary"],
+            "tags": classification["tags"],
+        }
+        asyncio.get_event_loop().run_in_executor(None, _fire_embedding, result_for_embedding)
+
+    except Exception as e:
+        logger.error(f"Context update failed for item {item_id}: {e}")
+        await update.message.reply_text(f"Something went wrong updating this item: {e}")
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         await update.message.reply_text("Sorry, this is a private bot.")
         return
+
+    if update.message.reply_to_message:
+        reply_msg_id = update.message.reply_to_message.message_id
+        if reply_msg_id in _pending_context:
+            item_id = _pending_context.pop(reply_msg_id)
+            await _handle_context_reply(update, context, item_id)
+            return
+
     user_id = _get_user_id(update)
     try:
         result = process_message(update.message.text, content_type="text", user_id=user_id)
@@ -651,6 +772,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         await update.message.reply_text("Sorry, this is a private bot.")
         return
+
+    if update.message.reply_to_message:
+        reply_msg_id = update.message.reply_to_message.message_id
+        if reply_msg_id in _pending_context:
+            item_id = _pending_context.pop(reply_msg_id)
+            await _handle_context_reply(update, context, item_id)
+            return
+
     user_id = _get_user_id(update)
     try:
         voice = update.message.voice
@@ -675,6 +804,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         await update.message.reply_text("Sorry, this is a private bot.")
         return
+
+    if update.message.reply_to_message:
+        reply_msg_id = update.message.reply_to_message.message_id
+        if reply_msg_id in _pending_context:
+            item_id = _pending_context.pop(reply_msg_id)
+            await _handle_context_reply(update, context, item_id)
+            return
+
     user_id = _get_user_id(update)
     try:
         photo = update.message.photo[-1]
@@ -934,14 +1071,43 @@ def run_bot():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    email_conv = ConversationHandler(
+        entry_points=[CommandHandler("email", email)],
+        states={
+            AWAITING_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _receive_email),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    search_conv = ConversationHandler(
+        entry_points=[CommandHandler("search", search)],
+        states={
+            AWAITING_SEARCH_KEYWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _receive_search_keyword),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("review", review))
+    app.add_handler(CommandHandler("categories", categories))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(reminder_conv)
     app.add_handler(nudge_conv)
+    app.add_handler(email_conv)
+    app.add_handler(search_conv)
+    app.add_handler(CallbackQueryHandler(handle_context_button, pattern="^ctx_"))
     app.add_handler(CallbackQueryHandler(handle_nudge_list_tap, pattern="^nudgelist_"))
     app.add_handler(CallbackQueryHandler(handle_nudge_action, pattern="^nudge_(done|archive|remind|keep|drop|back)_"))
+    app.add_handler(CallbackQueryHandler(handle_go_deep, pattern="^nudge_godeep_"))
     app.add_handler(CallbackQueryHandler(handle_rating, pattern="^(interest_|goal_)"))
+    app.add_handler(CallbackQueryHandler(handle_remind_tonight, pattern="^remind_tonight_"))
+    app.add_handler(CallbackQueryHandler(handle_review_page, pattern="^review_(more|prev)_"))
+    app.add_handler(CallbackQueryHandler(handle_search_page, pattern="^search_(more|prev)_"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

@@ -104,6 +104,7 @@ def _detail_keyboard(item: dict, has_email: bool = True) -> InlineKeyboardMarkup
     item_id = item["id"]
     if item["is_escalation"]:
         rows = [
+            [InlineKeyboardButton("✅ Done", callback_data=f"nudge_done_{item_id}")],
             [
                 InlineKeyboardButton("Keep — remind in 7 days", callback_data=f"nudge_keep_{item_id}"),
                 InlineKeyboardButton("Drop — archive it", callback_data=f"nudge_drop_{item_id}"),
